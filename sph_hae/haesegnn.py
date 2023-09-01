@@ -8,9 +8,18 @@ import e3nn_jax as e3nn
 import haiku as hk
 import jax.numpy as jnp
 from e3nn_jax import Irreps, IrrepsArray
+import jax
+import jraph
+from jax.tree_util import tree_map
 
-from .segnn import SEGNN, O3TensorProduct, O3TensorProductGate, SEGNNLayer
-from .utils import SteerableGraphsTuple
+from lagrangebench.models.segnn import (
+    SEGNN,
+    O3TensorProduct,
+    O3TensorProductGate,
+    SEGNNLayer,
+)
+from lagrangebench.utils import NodeType
+from lagrangebench.models.utils import SteerableGraphsTuple, features_2d_to_3d
 
 
 def avg_initialization(
@@ -206,10 +215,6 @@ class HAESEGNN(SEGNN):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # transform
-        assert (
-            self._velocity_aggregate == "all"
-        ), "SEGNN with attribute embedding is supposed to have all past velocities."
 
         # network
         self._latent_attribute_irreps = Irreps.spherical_harmonics(
@@ -233,8 +238,87 @@ class HAESEGNN(SEGNN):
             embed_msg_features=self._embed_msg_features,
         )
 
-    def __call__(self, features: Dict[str, jnp.ndarray]) -> jnp.ndarray:
-        st_graph = self._transform(features)
+    def _transform(
+        self, features: Dict[str, jnp.ndarray], particle_type: jnp.ndarray
+    ) -> Tuple[SteerableGraphsTuple, int]:
+        """Convert physical features to SteerableGraphsTuple for segnn."""
+        dim = features["vel_hist"].shape[1] // self._n_vels
+        assert (
+            dim == 3 or dim == 2
+        ), "The velocity history should be of shape (n_nodes, n_vels * 3)."
+
+        n_nodes = features["vel_hist"].shape[0]
+
+        features["vel_hist"] = features["vel_hist"].reshape(n_nodes, self._n_vels, dim)
+
+        if dim == 2:
+            # add zeros for z component for E(3) equivariance
+            features = features_2d_to_3d(features)
+
+        # keep all velocities for attribute embedding
+        vel = jnp.squeeze(features["vel_hist"])
+
+        rel_pos = features["rel_disp"]
+        edge_attributes = e3nn.spherical_harmonics(
+            self._attribute_irreps, rel_pos, normalize=True, normalization="integral"
+        )
+        vel_embedding = e3nn.spherical_harmonics(
+            self._attribute_irreps, vel, normalize=True, normalization="integral"
+        )
+        # scatter edge attributes to nodes (density)
+        node_attributes = vel_embedding
+        scattered_edges = tree_map(
+            lambda e: jraph.segment_mean(e, features["receivers"], n_nodes),
+            edge_attributes,
+        )
+        # transpose for broadcasting
+        node_attributes.array = jnp.transpose(
+            (
+                jnp.transpose(node_attributes.array, (0, 2, 1))
+                + jnp.expand_dims(scattered_edges.array, -1)
+            ),
+            (0, 2, 1),
+        )
+        # scalar attribute to 1 by default
+        node_attributes.array = node_attributes.array.at[..., 0].set(1.0)
+
+        node_features = [features["vel_hist"].reshape(n_nodes, self._n_vels * 3)]
+        node_features += [
+            features[k] for k in ["vel_mag", "bound", "force"] if k in features
+        ]
+        node_features = jnp.concatenate(node_features, axis=-1)
+
+        if not self._homogeneous_particles:
+            particles = jax.nn.one_hot(particle_type, NodeType.SIZE)
+            node_features = jnp.concatenate([node_features, particles], axis=-1)
+
+        edge_features = [features[k] for k in ["rel_disp", "rel_dist"] if k in features]
+        edge_features = jnp.concatenate(edge_features, axis=-1)
+
+        feature_graph = jraph.GraphsTuple(
+            nodes=IrrepsArray(self._node_features_irreps, node_features),
+            edges=None,
+            senders=features["senders"],
+            receivers=features["receivers"],
+            n_node=jnp.array([n_nodes]),
+            n_edge=jnp.array([len(features["senders"])]),
+            globals=None,
+        )
+        st_graph = SteerableGraphsTuple(
+            graph=feature_graph,
+            node_attributes=node_attributes,
+            edge_attributes=edge_attributes,
+            additional_message_features=IrrepsArray(
+                self._edge_features_irreps, edge_features
+            ),
+        )
+
+        return st_graph, dim
+
+    def __call__(
+        self, sample: Tuple[Dict[str, jnp.ndarray], jnp.ndarray]
+    ) -> jnp.ndarray:
+        st_graph, _ = self._transform(*sample)
         # keep full attributes for attribute embedding
         node_attributes_full = IrrepsArray(
             st_graph.node_attributes.irreps, st_graph.node_attributes.array.copy()
@@ -267,4 +351,4 @@ class HAESEGNN(SEGNN):
             node_attributes=node_attributes_full,
             edge_attributes=edge_attributes_full,
         )
-        return jnp.squeeze(self._decoder(st_graph).array)
+        return {"acc": jnp.squeeze(self._decoder(st_graph).array)}
